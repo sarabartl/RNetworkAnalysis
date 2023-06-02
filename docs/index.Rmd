@@ -1,0 +1,311 @@
+---
+title: "Network Analysis of an Online Chat Room"
+author: "Sara Bartl"
+date: "April 2023"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(readxl)
+library(readr)
+library(igraph)
+library(visNetwork)
+library(wesanderson)
+```
+
+## Introduction
+
+In this project, I visualise the network structure of an online multi-participant chat room. The goal is to create an informative visualisation that captures the relationships between the people in the chat room based on their interactions. 
+
+#### What is Social Network Analysis
+The goal of social network analysis is to uncover the relationships between actors by visualizing the connections between them. In a network, the actors are represented as nodes and the relationships between them are represented as links or edges. The idea behind social network analysis is that the relationships between actors are not random, but instead are representative of the social processes that underlie them. (Luke, 2015).
+
+#### Data
+The data I am working with comes from the NPS Chat Corpus (Frosith, Lin and Martell), which is distributed as part of the NLTK package. The dataset includes 14 snapshots of chat rooms, including all activity within the time frame of a few hours. As part of a project at the University of Birmingham, some of these chats have been annotated for their response structure: each turn by a chat room participant is coded for whether it either a) initiates a new topic, b) responds to a previous turn, and if so, which one or c) is too ambiguous to determine whether it is a) or b). 
+The goal of this project is to create an informative visual that captures the relationships between the people in the chat room based on their interactions.
+
+
+## A Look at the Data
+First, we read in the coded data from an excel file. 
+```{r}
+chat <- read_xlsx("11-08-20s_705posts.xlsx")
+chat
+```
+We can see that the data we just loaded in has 583 rows and four columns, USER, TURN and AGREEMENT. The USER column contains the anonymised names of the chat room participants. The MESSAGE column contains the messages sent in the chat room. The TURN column contains the number of the turn, with each individual contribution to the chat room (every time a chat room participant hits enter) counting as one instance, starting with 1 at the first turn. The AGREEMENT column contains the final code for a given turn. The values in this column can be X, ? or one or multiple numbers between 1 and the second to last turn of the chat. 
+
+## Creating a Node List
+There are two components we need to generate a network: a node list and an edge list. The node list is essentailly just a list of all the unique participants in the chat room. Creating the node list is therefore quite simple: we just take all the unique items from the USER column of the chat data. Additionally, we will add an ID column, so that each user is identifyable by a unique number (we will use these IDs later for the edge list as well.)
+
+```{r}
+nodes <- chat %>%
+  distinct(USER) %>%
+  rename("user" = USER) %>%
+  rowid_to_column("id")
+nodes
+```
+
+We see that we have 44 unique participants.
+
+## Creating an Edge List
+Wile the node list records all the entities in a network, the edge list records the relationships between them. Edges are also called links or ties.  In this case, a link (or edge) between two participants is established when they respond to each other. Each time participant A responds to participant B, we want to record a link of the weight 1 between A and B. Because the act of responding to someone is directed, we are going to distinguish between the person who is doing the responding and the person who is being responded to. So if person A responds to person B, we are going to record it as A-->B and if person B responds to person A, we will record it as B-->A. In other words, we are building a *directed* network. 
+
+To create an edge list then, we will go through all the turns in our data that contain responses and record who is responding to who. We will add this information in a 'respondee' column (who is being responded to) and a 'weight' column (how often does this person respond to the other person)
+
+```{r}
+chat_clean <- select(chat, -2)
+chat_clean$TURN <- as.character(chat_clean$TURN)
+# split up the rows with +s 
+for (i in 1:nrow(chat_clean)) {
+  if (grepl("+", chat_clean[i, 3], fixed = TRUE) == TRUE) { #check whether the agreement column contains pluses
+    current_turn <- chat_clean[i, 2] #current turn number
+    current_speaker <- chat_clean[i, 1] #current speaker
+    split_row <- as.list(strsplit(unlist(chat_clean[i,3]), "\\+")[[1]]) # split the row on pluses and store the numbers (response links) as a list
+    for (i in split_row) { #loop over the list of response links
+      chat_clean <- add_row(chat_clean, USER=toString(current_speaker), TURN=toString(current_turn), AGREEMENT=i) #add a row for each response link
+    }
+  }
+
+  else {
+    #if there is no + in the AGREEMENT column, do nothing
+  }
+}
+chat_clean$AGREEMENT <- as.double(chat_clean$AGREEMENT)
+chat_clean$AGREEMENT <- as.character(chat_clean$AGREEMENT)
+chat_clean <- chat_clean %>% drop_na() 
+chat$AGREEMENT <- as.double(chat$AGREEMENT)
+chat$AGREEMENT <- as.character(chat$AGREEMENT)
+chat$TURN <- as.double(chat$TURN) 
+chat$TURN <- as.character(chat$TURN)
+chat_clean <- chat_clean %>%
+  mutate(
+    respondee = NA,
+    weight = NA)
+x <- 1
+for (i in 1:nrow(chat_clean)) {
+  if (chat_clean[i,3] %in% chat$TURN == TRUE) { #if a turn exists in chat that has the same number as the response link (which is not the case for a response link to an entire turn group)
+    respondee_row <- which(as.double(chat$TURN) == as.double(chat_clean[i,3])) #get the row for the turn for the current response link 
+    chat_clean[i, 4] <- chat[respondee_row, 1] #assign the name of the turn that is being linked to to the respondee column
+    chat_clean[i, 5] <- x #add weight which is one (because this part will exclude turn groups)
+  }
+  
+  else { #if a turn links to a turn group
+    temp_tib <- filter(chat, as.integer(chat$TURN) == as.integer(chat_clean[i, 3])) #create a temporary tibble that contains only the turn group (n rows for n turns in turn group)
+    chat_clean[i, 4] <- temp_tib[1,1] #assign the name of the turn taker to respondee in chat clean
+    chat_clean[i, 5] <- x*nrow(temp_tib) # multiply 1 by rows in temp_tib (i.e. turns in turn group) and assign to weight column
+  }
+}
+chat_clean
+
+```
+
+We now have a table in which each row records the interaction between two participants. As you may notice, the weight column has some 1 values and some 2 values. The 2 values are for instances where someone's turn was split over two turns (someone wrote a line, hit enter and then followed this up with another turn right after). When someone now responds to those "two in one" turns, the weighting gets recorded as 2 instead of 1. 
+
+We can now add together all those interactions, so that we have a cummulative weight for each participant pairing (in both directions). In the same step, we will also delete the TURN and AGREEMENT columns and replace the pseudonyms of the participants with the IDs we created in the node list. The result is our edge list. 
+
+```{r}
+
+edge_links <- chat_clean %>%
+  group_by(USER, respondee) %>%
+  summarise(weight = n()) %>%
+  ungroup() 
+edges <- edge_links %>%
+  left_join(nodes, by = c("USER" = "user")) %>%
+  rename(from = id)
+
+edges <- edges %>% 
+  left_join(nodes, by = c("respondee" = "user")) %>% 
+  rename(to = id)
+edges <- select(edges, from, to, weight)
+edges
+
+```
+
+
+## Data Visualisation
+Now we can create a social network diagram. There is a variety of packages in R to facilitate the plotting of social networks. Here, we work with visNetwork, because it comes with inbuilt interactive features.
+
+The idea of this section is to move from the default network to a more and more informative and visually appealing visualisation. 
+
+#### Default Network
+This is the default network visNetwork creates. You can move the nodes, zoom in and clikc on a node to highlight the connections this node has with other nodes. 
+While this 
+```{r}
+nodes_vis <- nodes %>%
+  rename(label = "user") #change the nodes column name user to label
+edges_vis <- edges
+
+network <- visNetwork(nodes_vis, edges_vis) %>%
+ visLayout(randomSeed = 183)
+network
+
+```
+
+
+#### Add arrows
+There are many options for customizing this basic plot. For example, we can add arrows to mark the direction of the relationship.
+```{r}
+edges_vis <- edges_vis %>%
+  mutate(arrows = c("to"))
+
+visNetwork(nodes_vis, edges_vis) %>%
+ visLayout(randomSeed = 183)
+
+```
+
+
+#### Change Colors Globally
+We can also change the colors of both the edges and the nodes. To get more interesting color palettes, I am using the wesanderson package.
+```{r}
+# pick color palettes
+wes_grey <- wes_palettes$Royal1[1] # this has the grey for the edges
+wes_orange <- wes_palettes$Darjeeling2[3] # this has the node and edge highlight colors
+
+
+# color nodes by creating a color column in nodes_vis
+nodes_vis <- nodes_vis %>%
+  mutate(color = c(toString(wes_orange)))
+
+# adding edge color and highlight color (I tried adding it in the same way as above 
+# for the nodes by supplying a color and color.highlight column but for whatever reason
+# that did not work)
+network <- visNetwork(nodes_vis, edges_vis) %>%
+  visEdges(color = list(color = toString(wes_grey), highlight = toString(wes_orange))) %>%
+ visLayout(randomSeed = 183)
+network
+
+```
+
+
+#### Adjust Node Size 
+Let's make the node size informative, so that the node size represents information about how many turns a participant takes. The bigger a participant's node, the more times they write something in the chat.
+```{r}
+#get the number of turns per participant
+turns <- chat %>% 
+  count(USER) %>%
+  rename(label = "USER") %>%
+  rename(value = "n")
+
+nodes_vis <- full_join(nodes_vis, turns)
+
+network <- visNetwork(nodes_vis, edges_vis) %>%
+  visEdges(color = list(color = toString(wes_grey), highlight = toString(wes_orange))) %>%
+ visLayout(randomSeed = 183)
+
+```
+
+#### Adjust Node Color for Response Ratio
+Another interesting way of characterising this data is by looking at the number of responses a participant receives and how many responses they themselves make. This can be captured as a ratio of responses in to responses out and can be encoded in the color of each node. 
+We can do this with RGB. A participant who only responds to other people but gets no responses in turn will be neon purple. A participant who only receives responses but does no responding will be neon yellow. All other percenteges will fall on a color spectrum between those poles. 
+```{r}
+# get links in per participant
+links_in_df <- edges %>%
+  group_by(to) %>%
+  summarise(links_in = sum(weight))
+
+# change to column to id (for join)
+links_in_df <- links_in_df %>%
+  rename(id = "to")
+
+#join
+nodes_vis <- full_join(nodes_vis, links_in_df)
+
+# repeat for links out per participant
+links_out_df <- edges %>%
+  group_by(from) %>%
+  summarise(links_out = sum(weight))
+
+links_out_df <- links_out_df %>%
+  rename(id = "from")
+
+nodes_vis <- full_join(nodes_vis, links_out_df)
+
+# sub links_in and links_out NAs for 0
+nodes_vis$links_in <- replace_na(nodes_vis$links_in, 0)
+nodes_vis$links_out <- replace_na(nodes_vis$links_out, 0)
+
+# make a new column for ratio of links in and links out
+nodes_vis <- nodes_vis %>%
+  mutate(in_ratio = nodes_vis$links_in/(nodes_vis$links_in + nodes_vis$links_out)) %>%
+  mutate(out_ratio = nodes_vis$links_out/(nodes_vis$links_in + nodes_vis$links_out))
+
+nodes_vis
+
+# replace all NAs (nodes without edges) with custom rgb values
+nodes_vis$in_ratio <- replace_na(nodes_vis$in_ratio, 0.85)
+nodes_vis$out_ratio <- replace_na(nodes_vis$out_ratio, 0.999)
+
+# red is constant, green is ins, blue is outs
+for (i in 1:nrow(nodes_vis)) {
+  color <- rgb(0.85, nodes_vis[i, 7], nodes_vis[i, 8])
+  nodes_vis[i, 3] <- color
+}
+
+
+visNetwork(nodes_vis, edges_vis) %>%
+ visLayout(randomSeed = 183)
+
+
+```
+
+We can see that the nodes in the central cluster all fall somewhere in-between the extremes. On the edges, we have two pairs of nodes that have on participant with only responses in and one participant with only responses out. All nodes that do not have any edges (no responses in or out) remain a pale blue.
+
+#### Adjust Edge Width for Number of Interactions
+We can also adjust the edge width as a function of the weight column, that is based on the number of interactions between two nodes. The more links two nodes have, the wider that connecting link will be.
+```{r}
+# create a width column and supply weight/5 as the value
+edges_vis <- edges_vis %>%
+  mutate(width = weight/3)
+
+visNetwork(nodes_vis, edges_vis) %>%
+  visEdges(color = list(color = toString(wes_grey[1]), highlight = toString(wes_orange))) %>%
+ visLayout(randomSeed = 183)
+
+```
+
+
+
+#### Dropping Edges
+
+Removing edges that are low in their weighting can help make a network diagram clearer, as it removes some of the visual noise. Theoretically, a low weighting of an edge represents a weak link between two actors. Therefore, excluding edges with low weighting scores means removing weak links in the network. However, what constitutes a 'weak' link will vary from network to network. Let us therefore have a look at the distribution of weights across this particular chat. 
+
+#### Edge Weight Distribution
+
+```{r}
+
+ggplot(edges_vis, aes(x=weight)) +
+  geom_histogram(binwidth=1, color = "gray", fill = toString(wes_orange)) +
+  labs(x = "Edge Weight", y = "Count") +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 80, by = 10))
+
+```
+
+As we can see, the most frequent weighting of directed links in this data is 1. 
+Let's remove links with a weight of 1 and compare that to the original network with all edges included.  
+
+#### Network All Edge Weights
+
+```{r}
+visNetwork(nodes_vis, edges_vis) %>%
+  visEdges(color = list(color = toString(wes_grey[1]), highlight = toString(wes_orange))) %>%
+ visLayout(randomSeed = 183)
+```
+
+#### Network with Edge Weight > 1
+
+```{r}
+reduced_edges <- edges_vis %>%
+  filter(weight > 1)
+visNetwork(nodes_vis, reduced_edges)%>% 
+  visEdges(color = list(color = toString(wes_grey[1]), highlight = toString(wes_orange))) %>%
+  visLayout(randomSeed = 183)
+
+```
+
+We can see that the central cluster becomes less busy. Four nodes that only have one-weighted links have dropped out of the center and moved to the edge. 
+
+
